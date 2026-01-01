@@ -5,6 +5,7 @@ plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.androidLibrary)
     alias(libs.plugins.kotlinSerialization)
+    alias(libs.plugins.dokka)
     `maven-publish`
     signing
 }
@@ -124,6 +125,20 @@ publishing {
             name = "localStaging"
             url = uri(layout.buildDirectory.dir("staging-deploy"))
         }
+    }
+}
+
+// Javadoc jar using Dokka
+val javadocJar by tasks.registering(Jar::class) {
+    dependsOn(tasks.named("dokkaHtml"))
+    archiveClassifier.set("javadoc")
+    from(tasks.named("dokkaHtml").map { it.outputs.files })
+}
+
+// Attach javadoc to publications
+publishing {
+    publications.withType<MavenPublication> {
+        artifact(javadocJar)
     }
 }
 

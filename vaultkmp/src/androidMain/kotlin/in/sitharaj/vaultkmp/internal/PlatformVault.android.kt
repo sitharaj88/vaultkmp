@@ -17,9 +17,9 @@
 package `in`.sitharaj.vaultkmp.internal
 
 import `in`.sitharaj.vaultkmp.VaultConfig
+import `in`.sitharaj.vaultkmp.VaultInitializer
 import `in`.sitharaj.vaultkmp.VaultStore
 import `in`.sitharaj.vaultkmp.entry.*
-import android.content.Context
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -47,27 +47,13 @@ internal class AndroidVault(
     private val encryptor = Encryptor(config)
     private val json = Json { ignoreUnknownKeys = true }
     
-    // DataStore instance - must be initialized with context
-    private lateinit var dataStore: androidx.datastore.core.DataStore<Preferences>
-    
-    companion object {
-        private var appContext: Context? = null
-        
-        /**
-         * Initialize with application context. Must be called before using VaultStore on Android.
-         */
-        fun initialize(context: Context) {
-            appContext = context.applicationContext
-        }
-        
-        private val Context.vaultDataStore by preferencesDataStore(name = "vault_store")
+    // DataStore instance - lazy initialized with context
+    private val dataStore: androidx.datastore.core.DataStore<Preferences> by lazy {
+        VaultInitializer.context.vaultDataStore
     }
     
-    init {
-        val context = appContext ?: throw IllegalStateException(
-            "VaultStore not initialized. Call AndroidVault.initialize(context) in Application.onCreate()"
-        )
-        dataStore = context.vaultDataStore
+    companion object {
+        private val android.content.Context.vaultDataStore by preferencesDataStore(name = "vault_store")
     }
     
     @OptIn(ExperimentalEncodingApi::class)
