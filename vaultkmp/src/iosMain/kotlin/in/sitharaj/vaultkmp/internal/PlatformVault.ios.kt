@@ -17,9 +17,9 @@
 package `in`.sitharaj.vaultkmp.internal
 
 import `in`.sitharaj.vaultkmp.VaultConfig
+import `in`.sitharaj.vaultkmp.VaultOperation
 import `in`.sitharaj.vaultkmp.VaultStore
 import `in`.sitharaj.vaultkmp.entry.*
-import kotlinx.cinterop.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
@@ -28,7 +28,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import platform.Foundation.*
-import platform.Security.*
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
@@ -40,98 +39,39 @@ internal actual fun createPlatformVault(config: VaultConfig): VaultStore {
 }
 
 /**
- * iOS implementation of VaultStore using Keychain Services.
+ * iOS implementation of VaultStore using NSUserDefaults with encryption.
  * 
- * This implementation stores all data in the iOS Keychain, which provides:
- * - Hardware-backed encryption on devices with Secure Enclave
- * - Automatic encryption at rest
- * - Access control via kSecAttrAccessible
+ * This implementation provides:
+ * - AES encryption via the Encryptor class
+ * - Thread-safe operations using Mutex
+ * - Audit logging support
+ * 
+ * Note: For highly sensitive data, consider using iOS Keychain directly 
+ * or a specialized security library.
  */
-@OptIn(ExperimentalForeignApi::class, ExperimentalEncodingApi::class)
+@OptIn(ExperimentalEncodingApi::class)
 internal class IosVault(
     override val config: VaultConfig
 ) : VaultStore {
     
-    private val serviceName = "in.sitharaj.vaultkmp.${config.name}"
+    private val encryptor = Encryptor(config)
+    private val defaults = NSUserDefaults.standardUserDefaults
+    private val prefix = "vault_${config.name}_"
     private val json = Json { ignoreUnknownKeys = true }
     private val observableCache = mutableMapOf<String, MutableStateFlow<String?>>()
     private val mutex = Mutex() // Thread safety
+    private val logger = config.auditLogger
     
-    /**
-     * Create a Keychain query dictionary for the given key.
-     */
-    @Suppress("UNCHECKED_CAST")
-    private fun createQuery(key: String): MutableMap<Any?, Any?> {
-        return mutableMapOf<Any?, Any?>(
-            kSecClass to kSecClassGenericPassword,
-            kSecAttrService to serviceName,
-            kSecAttrAccount to key
-        )
+    private fun prefixedKey(key: String) = "$prefix$key"
+    
+    private fun encryptAndEncode(value: String): String {
+        val encrypted = encryptor.encrypt(value.encodeToByteArray())
+        return Base64.encode(encrypted)
     }
     
-    /**
-     * Save data to Keychain.
-     */
-    private fun saveToKeychain(key: String, value: String): Boolean = memScoped {
-        // First, try to delete any existing item
-        val deleteQuery = createQuery(key).toNSMutableDictionary()
-        SecItemDelete(deleteQuery as CFDictionaryRef)
-        
-        // Create add query with data
-        val data = (value as NSString).dataUsingEncoding(NSUTF8StringEncoding)
-        if (data == null) return false
-        
-        val addQuery = createQuery(key).toMutableMap().apply {
-            put(kSecValueData, data)
-            // Accessible after first unlock - good balance of security and usability
-            put(kSecAttrAccessible, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
-        }.toNSMutableDictionary()
-        
-        val status = SecItemAdd(addQuery as CFDictionaryRef, null)
-        return status == errSecSuccess
-    }
-    
-    /**
-     * Load data from Keychain.
-     */
-    private fun loadFromKeychain(key: String): String? = memScoped {
-        val query = createQuery(key).toMutableMap().apply {
-            put(kSecReturnData, kCFBooleanTrue)
-            put(kSecMatchLimit, kSecMatchLimitOne)
-        }.toNSMutableDictionary()
-        
-        val dataRef = alloc<CFTypeRefVar>()
-        val status = SecItemCopyMatching(query as CFDictionaryRef, dataRef.ptr)
-        
-        if (status == errSecSuccess) {
-            val data = CFBridgingRelease(dataRef.value) as? NSData
-            if (data != null) {
-                return NSString.create(data, NSUTF8StringEncoding) as? String
-            }
-        }
-        return null
-    }
-    
-    /**
-     * Delete data from Keychain.
-     */
-    private fun deleteFromKeychain(key: String): Boolean {
-        val query = createQuery(key).toNSMutableDictionary()
-        val status = SecItemDelete(query as CFDictionaryRef)
-        return status == errSecSuccess || status == errSecItemNotFound
-    }
-    
-    /**
-     * Convert Map to NSMutableDictionary.
-     */
-    private fun Map<Any?, Any?>.toNSMutableDictionary(): NSMutableDictionary {
-        val dict = NSMutableDictionary()
-        for ((key, value) in this) {
-            if (key != null && value != null) {
-                dict.setObject(value as Any, key as Any)
-            }
-        }
-        return dict
+    private fun decodeAndDecrypt(value: String): String {
+        val encrypted = Base64.decode(value)
+        return encryptor.decrypt(encrypted).decodeToString()
     }
     
     private fun notifyObservers(key: String, value: String?) {
@@ -141,12 +81,28 @@ internal class IosVault(
     // ==================== String Operations ====================
     
     override suspend fun putString(key: String, value: String): Unit = mutex.withLock {
-        saveToKeychain(key, value)
-        notifyObservers(key, value)
+        try {
+            val encrypted = encryptAndEncode(value)
+            defaults.setObject(encrypted, prefixedKey(key))
+            defaults.synchronize()
+            notifyObservers(key, value)
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
+        }
     }
     
     override suspend fun getString(key: String): String? = mutex.withLock {
-        loadFromKeychain(key)
+        try {
+            val encrypted = defaults.stringForKey(prefixedKey(key))
+            val result = encrypted?.let { decodeAndDecrypt(it) }
+            logger.log(VaultOperation.GET, key, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
+            null
+        }
     }
     
     override suspend fun getString(key: String, default: String): String {
@@ -225,15 +181,28 @@ internal class IosVault(
     
     // ==================== ByteArray Operations ====================
     
-    override suspend fun putBytes(key: String, value: ByteArray) {
-        putString(key, Base64.encode(value))
+    override suspend fun putBytes(key: String, value: ByteArray): Unit = mutex.withLock {
+        try {
+            val encrypted = encryptor.encrypt(value)
+            val base64 = Base64.encode(encrypted)
+            defaults.setObject(base64, prefixedKey(key))
+            defaults.synchronize()
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
+        }
     }
     
-    override suspend fun getBytes(key: String): ByteArray? {
-        val base64 = getString(key) ?: return null
-        return try {
-            Base64.decode(base64)
+    override suspend fun getBytes(key: String): ByteArray? = mutex.withLock {
+        try {
+            val base64 = defaults.stringForKey(prefixedKey(key)) ?: return@withLock null
+            val encrypted = Base64.decode(base64)
+            val result = encryptor.decrypt(encrypted)
+            logger.log(VaultOperation.GET, key, true)
+            result
         } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
             null
         }
     }
@@ -256,47 +225,50 @@ internal class IosVault(
     
     // ==================== Utility Operations ====================
     
-    override suspend fun contains(key: String): Boolean {
-        return getString(key) != null
+    override suspend fun contains(key: String): Boolean = mutex.withLock {
+        val result = defaults.objectForKey(prefixedKey(key)) != null
+        logger.log(VaultOperation.CONTAINS, key, true)
+        result
     }
     
     override suspend fun remove(key: String): Unit = mutex.withLock {
-        deleteFromKeychain(key)
-        notifyObservers(key, null)
+        try {
+            defaults.removeObjectForKey(prefixedKey(key))
+            defaults.synchronize()
+            notifyObservers(key, null)
+            logger.log(VaultOperation.REMOVE, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.REMOVE, key, false, e.message)
+        }
     }
     
     override suspend fun clear(): Unit = mutex.withLock {
-        // Query all items for this service and delete them
-        val query = mutableMapOf<Any?, Any?>(
-            kSecClass to kSecClassGenericPassword,
-            kSecAttrService to serviceName
-        ).toNSMutableDictionary()
-        
-        SecItemDelete(query as CFDictionaryRef)
-        observableCache.values.forEach { it.value = null }
+        try {
+            val dict = defaults.dictionaryRepresentation()
+            dict.keys.filterIsInstance<String>()
+                .filter { it.startsWith(prefix) }
+                .forEach { defaults.removeObjectForKey(it) }
+            defaults.synchronize()
+            observableCache.values.forEach { it.value = null }
+            logger.log(VaultOperation.CLEAR, null, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.CLEAR, null, false, e.message)
+        }
     }
     
     override suspend fun keys(): Set<String> = mutex.withLock {
-        // Query all items for this service
-        val query = mutableMapOf<Any?, Any?>(
-            kSecClass to kSecClassGenericPassword,
-            kSecAttrService to serviceName,
-            kSecReturnAttributes to kCFBooleanTrue,
-            kSecMatchLimit to kSecMatchLimitAll
-        ).toNSMutableDictionary()
-        
-        memScoped {
-            val resultRef = alloc<CFTypeRefVar>()
-            val status = SecItemCopyMatching(query as CFDictionaryRef, resultRef.ptr)
-            
-            if (status == errSecSuccess) {
-                val items = CFBridgingRelease(resultRef.value) as? List<*>
-                return items?.mapNotNull { item ->
-                    (item as? Map<*, *>)?.get(kSecAttrAccount) as? String
-                }?.toSet() ?: emptySet()
-            }
+        try {
+            val result = defaults.dictionaryRepresentation().keys
+                .filterIsInstance<String>()
+                .filter { it.startsWith(prefix) }
+                .map { it.removePrefix(prefix) }
+                .toSet()
+            logger.log(VaultOperation.KEYS, null, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.KEYS, null, false, e.message)
+            emptySet()
         }
-        return emptySet()
     }
     
     // ==================== Type-Safe Entry Accessors ====================
