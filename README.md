@@ -20,7 +20,7 @@ A Kotlin Multiplatform secure encrypted key-value storage library.
 | Platform | Encryption | Storage |
 |----------|------------|---------|
 | Android | Android Keystore + AES-256-GCM | DataStore Preferences |
-| iOS | Keychain Services | Keychain |
+| iOS | NSUserDefaults + AES-256-GCM | NSUserDefaults |
 | Desktop | AES-256-GCM (PBKDF2) | Encrypted Files |
 | JS/WASM | XOR obfuscation* | localStorage |
 
@@ -130,7 +130,7 @@ class MyApplication : Application() {
 
 ### iOS
 
-No special setup required. Keychain access is automatic.
+No special setup required. Uses `NSUserDefaults` with AES-256-GCM encryption.
 
 ### Desktop
 
