@@ -19,28 +19,42 @@ package `in`.sitharaj.vaultkmp.internal
 import `in`.sitharaj.vaultkmp.VaultConfig
 import `in`.sitharaj.vaultkmp.VaultStore
 import `in`.sitharaj.vaultkmp.entry.*
-import kotlinx.browser.localStorage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
-import org.w3c.dom.get
-import org.w3c.dom.set
 import kotlin.io.encoding.Base64
 import kotlin.io.encoding.ExperimentalEncodingApi
 
+// External JS localStorage access for WASM
+@JsFun("(key, value) => localStorage.setItem(key, value)")
+private external fun jsSetItem(key: String, value: String)
+
+@JsFun("(key) => localStorage.getItem(key)")
+private external fun jsGetItem(key: String): String?
+
+@JsFun("(key) => localStorage.removeItem(key)")
+private external fun jsRemoveItem(key: String)
+
+@JsFun("() => localStorage.length")
+private external fun jsStorageLength(): Int
+
+@JsFun("(index) => localStorage.key(index)")
+private external fun jsStorageKey(index: Int): String?
+
 /**
- * Factory function to create JS VaultStore.
+ * Factory function to create WASM JS VaultStore.
  */
 internal actual fun createPlatformVault(config: VaultConfig): VaultStore {
-    return JsVault(config)
+    return WasmJsVault(config)
 }
 
 /**
- * JavaScript implementation of VaultStore using localStorage.
+ * WASM JS implementation of VaultStore using localStorage via JS interop.
  */
-internal class JsVault(
+@OptIn(ExperimentalEncodingApi::class)
+internal class WasmJsVault(
     override val config: VaultConfig
 ) : VaultStore {
     
@@ -49,13 +63,11 @@ internal class JsVault(
     private val prefix = "vault_${config.name}_"
     private val observableCache = mutableMapOf<String, MutableStateFlow<String?>>()
     
-    @OptIn(ExperimentalEncodingApi::class)
     private fun encryptAndEncode(value: String): String {
         val encrypted = encryptor.encrypt(value.encodeToByteArray())
         return Base64.encode(encrypted)
     }
     
-    @OptIn(ExperimentalEncodingApi::class)
     private fun decodeAndDecrypt(value: String): String {
         val encrypted = Base64.decode(value)
         return encryptor.decrypt(encrypted).decodeToString()
@@ -70,13 +82,17 @@ internal class JsVault(
     // ==================== String Operations ====================
     
     override suspend fun putString(key: String, value: String) {
-        localStorage[prefixedKey(key)] = encryptAndEncode(value)
+        jsSetItem(prefixedKey(key), encryptAndEncode(value))
         notifyObservers(key, value)
     }
     
     override suspend fun getString(key: String): String? {
-        val encoded = localStorage[prefixedKey(key)] ?: return null
-        return decodeAndDecrypt(encoded)
+        val encoded = jsGetItem(prefixedKey(key)) ?: return null
+        return try {
+            decodeAndDecrypt(encoded)
+        } catch (e: Exception) {
+            null
+        }
     }
     
     override suspend fun getString(key: String, default: String): String {
@@ -155,16 +171,18 @@ internal class JsVault(
     
     // ==================== ByteArray Operations ====================
     
-    @OptIn(ExperimentalEncodingApi::class)
     override suspend fun putBytes(key: String, value: ByteArray) {
         val encrypted = encryptor.encrypt(value)
-        localStorage[prefixedKey(key)] = Base64.encode(encrypted)
+        jsSetItem(prefixedKey(key), Base64.encode(encrypted))
     }
     
-    @OptIn(ExperimentalEncodingApi::class)
     override suspend fun getBytes(key: String): ByteArray? {
-        val encoded = localStorage[prefixedKey(key)] ?: return null
-        return encryptor.decrypt(Base64.decode(encoded))
+        val encoded = jsGetItem(prefixedKey(key)) ?: return null
+        return try {
+            encryptor.decrypt(Base64.decode(encoded))
+        } catch (e: Exception) {
+            null
+        }
     }
     
     // ==================== Object Operations ====================
@@ -186,30 +204,32 @@ internal class JsVault(
     // ==================== Utility Operations ====================
     
     override suspend fun contains(key: String): Boolean {
-        return localStorage[prefixedKey(key)] != null
+        return jsGetItem(prefixedKey(key)) != null
     }
     
     override suspend fun remove(key: String) {
-        localStorage.removeItem(prefixedKey(key))
+        jsRemoveItem(prefixedKey(key))
         notifyObservers(key, null)
     }
     
     override suspend fun clear() {
         val keysToRemove = mutableListOf<String>()
-        for (i in 0 until localStorage.length) {
-            val key = localStorage.key(i) ?: continue
+        val length = jsStorageLength()
+        for (i in 0 until length) {
+            val key = jsStorageKey(i) ?: continue
             if (key.startsWith(prefix)) {
                 keysToRemove.add(key)
             }
         }
-        keysToRemove.forEach { localStorage.removeItem(it) }
+        keysToRemove.forEach { jsRemoveItem(it) }
         observableCache.values.forEach { it.value = null }
     }
     
     override suspend fun keys(): Set<String> {
         val keys = mutableSetOf<String>()
-        for (i in 0 until localStorage.length) {
-            val key = localStorage.key(i) ?: continue
+        val length = jsStorageLength()
+        for (i in 0 until length) {
+            val key = jsStorageKey(i) ?: continue
             if (key.startsWith(prefix)) {
                 keys.add(key.removePrefix(prefix))
             }
