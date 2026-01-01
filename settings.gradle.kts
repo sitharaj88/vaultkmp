@@ -15,3 +15,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "VaultKMP"
 include(":vaultkmp")
+include(":sample:composeApp")
