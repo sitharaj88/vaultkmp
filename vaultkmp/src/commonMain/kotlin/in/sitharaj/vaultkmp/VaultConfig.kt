@@ -26,12 +26,16 @@ import kotlin.time.Duration.Companion.days
  * @property encryptionLevel Level of encryption to use
  * @property keyAlias Alias for the encryption key (used in hardware-backed storage)
  * @property cacheDuration How long to cache values in memory (null = forever)
+ * @property auditLogger Logger for tracking vault operations
+ * @property schemaVersion Schema version for migrations
  */
 public data class VaultConfig(
     val name: String,
     val encryptionLevel: EncryptionLevel = EncryptionLevel.HIGH,
     val keyAlias: String = "vault_master_key",
     val cacheDuration: Duration? = null,
+    val auditLogger: VaultAuditLogger = NoOpAuditLogger,
+    val schemaVersion: Int = 1,
 ) {
     public companion object {
         /**
@@ -51,6 +55,8 @@ public data class VaultConfig(
         private var encryptionLevel: EncryptionLevel = EncryptionLevel.HIGH
         private var keyAlias: String = "vault_master_key"
         private var cacheDuration: Duration? = null
+        private var auditLogger: VaultAuditLogger = NoOpAuditLogger
+        private var schemaVersion: Int = 1
 
         /**
          * Set the vault name (must be unique per vault instance).
@@ -74,13 +80,30 @@ public data class VaultConfig(
         public fun cacheDuration(duration: Duration?): Builder = apply { this.cacheDuration = duration }
 
         /**
+         * Set the audit logger for tracking operations.
+         */
+        public fun auditLogger(logger: VaultAuditLogger): Builder = apply { this.auditLogger = logger }
+        
+        /**
+         * Enable console logging for debugging.
+         */
+        public fun enableConsoleLogging(): Builder = apply { this.auditLogger = ConsoleAuditLogger }
+
+        /**
+         * Set the schema version for migrations.
+         */
+        public fun schemaVersion(version: Int): Builder = apply { this.schemaVersion = version }
+
+        /**
          * Build the VaultConfig.
          */
         public fun build(): VaultConfig = VaultConfig(
             name = name,
             encryptionLevel = encryptionLevel,
             keyAlias = keyAlias,
-            cacheDuration = cacheDuration
+            cacheDuration = cacheDuration,
+            auditLogger = auditLogger,
+            schemaVersion = schemaVersion
         )
     }
 }

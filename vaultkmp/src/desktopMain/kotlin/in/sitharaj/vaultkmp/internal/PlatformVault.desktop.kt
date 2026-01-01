@@ -17,15 +17,19 @@
 package `in`.sitharaj.vaultkmp.internal
 
 import `in`.sitharaj.vaultkmp.VaultConfig
+import `in`.sitharaj.vaultkmp.VaultOperation
 import `in`.sitharaj.vaultkmp.VaultStore
 import `in`.sitharaj.vaultkmp.entry.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.*
+import java.util.Arrays as JavaArrays
 
 /**
  * Factory function to create Desktop VaultStore.
@@ -36,6 +40,12 @@ internal actual fun createPlatformVault(config: VaultConfig): VaultStore {
 
 /**
  * Desktop/JVM implementation of VaultStore using encrypted file storage.
+ * 
+ * Features:
+ * - AES-256-GCM encryption with PBKDF2 key derivation
+ * - Thread-safe operations using Mutex
+ * - Audit logging support
+ * - Files stored in ~/.vaultkmp/{vault_name}/
  */
 internal class DesktopVault(
     override val config: VaultConfig
@@ -44,6 +54,8 @@ internal class DesktopVault(
     private val encryptor = Encryptor(config)
     private val json = Json { ignoreUnknownKeys = true }
     private val observableCache = mutableMapOf<String, MutableStateFlow<String?>>()
+    private val mutex = Mutex() // Thread safety
+    private val logger = config.auditLogger
     
     private val storageDir: File by lazy {
         val userHome = System.getProperty("user.home")
@@ -73,14 +85,34 @@ internal class DesktopVault(
         observableCache[key]?.value = value
     }
     
-    // ==================== String Operations ====================
-    
-    override suspend fun putString(key: String, value: String) {
-        encryptAndSave(key, value)
+    /**
+     * Clear sensitive data from byte array.
+     */
+    private fun clearArray(array: ByteArray) {
+        JavaArrays.fill(array, 0.toByte())
     }
     
-    override suspend fun getString(key: String): String? {
-        return loadAndDecrypt(key)
+    // ==================== String Operations ====================
+    
+    override suspend fun putString(key: String, value: String): Unit = mutex.withLock {
+        try {
+            encryptAndSave(key, value)
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
+        }
+    }
+    
+    override suspend fun getString(key: String): String? = mutex.withLock {
+        try {
+            val result = loadAndDecrypt(key)
+            logger.log(VaultOperation.GET, key, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
+            null
+        }
     }
     
     override suspend fun getString(key: String, default: String): String {
@@ -159,15 +191,32 @@ internal class DesktopVault(
     
     // ==================== ByteArray Operations ====================
     
-    override suspend fun putBytes(key: String, value: ByteArray) {
-        val encrypted = encryptor.encrypt(value)
-        keyToFile(key).writeBytes(encrypted)
+    override suspend fun putBytes(key: String, value: ByteArray): Unit = mutex.withLock {
+        try {
+            val encrypted = encryptor.encrypt(value)
+            keyToFile(key).writeBytes(encrypted)
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
+        }
     }
     
-    override suspend fun getBytes(key: String): ByteArray? {
-        val file = keyToFile(key)
-        if (!file.exists()) return null
-        return encryptor.decrypt(file.readBytes())
+    override suspend fun getBytes(key: String): ByteArray? = mutex.withLock {
+        try {
+            val file = keyToFile(key)
+            if (!file.exists()) {
+                logger.log(VaultOperation.GET, key, true)
+                return@withLock null
+            }
+            val encrypted = file.readBytes()
+            val result = encryptor.decrypt(encrypted)
+            logger.log(VaultOperation.GET, key, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
+            null
+        }
     }
     
     // ==================== Object Operations ====================
@@ -188,31 +237,50 @@ internal class DesktopVault(
     
     // ==================== Utility Operations ====================
     
-    override suspend fun contains(key: String): Boolean {
-        return keyToFile(key).exists()
+    override suspend fun contains(key: String): Boolean = mutex.withLock {
+        val result = keyToFile(key).exists()
+        logger.log(VaultOperation.CONTAINS, key, true)
+        result
     }
     
-    override suspend fun remove(key: String) {
-        keyToFile(key).delete()
-        notifyObservers(key, null)
+    override suspend fun remove(key: String): Unit = mutex.withLock {
+        try {
+            keyToFile(key).delete()
+            notifyObservers(key, null)
+            logger.log(VaultOperation.REMOVE, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.REMOVE, key, false, e.message)
+        }
     }
     
-    override suspend fun clear() {
-        storageDir.listFiles()?.forEach { it.delete() }
-        observableCache.values.forEach { it.value = null }
+    override suspend fun clear(): Unit = mutex.withLock {
+        try {
+            storageDir.listFiles()?.forEach { it.delete() }
+            observableCache.values.forEach { it.value = null }
+            logger.log(VaultOperation.CLEAR, null, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.CLEAR, null, false, e.message)
+        }
     }
     
-    override suspend fun keys(): Set<String> {
-        return storageDir.listFiles()
-            ?.filter { it.extension == "vault" }
-            ?.mapNotNull { file ->
-                try {
-                    String(Base64.getDecoder().decode(file.nameWithoutExtension))
-                } catch (e: Exception) {
-                    null
+    override suspend fun keys(): Set<String> = mutex.withLock {
+        try {
+            val result = storageDir.listFiles()
+                ?.filter { it.extension == "vault" }
+                ?.mapNotNull { file ->
+                    try {
+                        String(Base64.getDecoder().decode(file.nameWithoutExtension))
+                    } catch (e: Exception) {
+                        null
+                    }
                 }
-            }
-            ?.toSet() ?: emptySet()
+                ?.toSet() ?: emptySet()
+            logger.log(VaultOperation.KEYS, null, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.KEYS, null, false, e.message)
+            emptySet()
+        }
     }
     
     // ==================== Type-Safe Entry Accessors ====================

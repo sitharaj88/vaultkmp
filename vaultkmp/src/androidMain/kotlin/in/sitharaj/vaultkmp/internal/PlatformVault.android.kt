@@ -18,6 +18,7 @@ package `in`.sitharaj.vaultkmp.internal
 
 import `in`.sitharaj.vaultkmp.VaultConfig
 import `in`.sitharaj.vaultkmp.VaultInitializer
+import `in`.sitharaj.vaultkmp.VaultOperation
 import `in`.sitharaj.vaultkmp.VaultStore
 import `in`.sitharaj.vaultkmp.entry.*
 import androidx.datastore.preferences.core.*
@@ -25,6 +26,8 @@ import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.json.Json
 import kotlin.io.encoding.Base64
@@ -39,13 +42,23 @@ internal actual fun createPlatformVault(config: VaultConfig): VaultStore {
 
 /**
  * Android implementation of VaultStore using DataStore with encryption.
+ * 
+ * Features:
+ * - Android Keystore for hardware-backed key storage
+ * - AES-256-GCM encryption
+ * - Thread-safe operations using Mutex
+ * - Audit logging support
+ * - DataStore for persistent storage
  */
+@OptIn(ExperimentalEncodingApi::class)
 internal class AndroidVault(
     override val config: VaultConfig
 ) : VaultStore {
     
     private val encryptor = Encryptor(config)
     private val json = Json { ignoreUnknownKeys = true }
+    private val mutex = Mutex() // Thread safety
+    private val logger = config.auditLogger
     
     // DataStore instance - lazy initialized with context
     private val dataStore: androidx.datastore.core.DataStore<Preferences> by lazy {
@@ -56,13 +69,11 @@ internal class AndroidVault(
         private val android.content.Context.vaultDataStore by preferencesDataStore(name = "vault_store")
     }
     
-    @OptIn(ExperimentalEncodingApi::class)
     private fun encryptAndEncode(value: String): String {
         val encrypted = encryptor.encrypt(value.encodeToByteArray())
         return Base64.encode(encrypted)
     }
     
-    @OptIn(ExperimentalEncodingApi::class)
     private fun decodeAndDecrypt(value: String): String {
         val encrypted = Base64.decode(value)
         return encryptor.decrypt(encrypted).decodeToString()
@@ -72,16 +83,29 @@ internal class AndroidVault(
     
     // ==================== String Operations ====================
     
-    override suspend fun putString(key: String, value: String) {
-        dataStore.edit { prefs ->
-            prefs[stringKey(key)] = encryptAndEncode(value)
+    override suspend fun putString(key: String, value: String): Unit = mutex.withLock {
+        try {
+            dataStore.edit { prefs ->
+                prefs[stringKey(key)] = encryptAndEncode(value)
+            }
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
         }
     }
     
-    override suspend fun getString(key: String): String? {
-        val prefs = dataStore.data.first()
-        val encrypted = prefs[stringKey(key)] ?: return null
-        return decodeAndDecrypt(encrypted)
+    override suspend fun getString(key: String): String? = mutex.withLock {
+        try {
+            val prefs = dataStore.data.first()
+            val encrypted = prefs[stringKey(key)]
+            val result = encrypted?.let { decodeAndDecrypt(it) }
+            logger.log(VaultOperation.GET, key, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
+            null
+        }
     }
     
     override suspend fun getString(key: String, default: String): String {
@@ -160,19 +184,30 @@ internal class AndroidVault(
     
     // ==================== ByteArray Operations ====================
     
-    @OptIn(ExperimentalEncodingApi::class)
-    override suspend fun putBytes(key: String, value: ByteArray) {
-        val encrypted = encryptor.encrypt(value)
-        dataStore.edit { prefs ->
-            prefs[stringKey(key)] = Base64.encode(encrypted)
+    override suspend fun putBytes(key: String, value: ByteArray): Unit = mutex.withLock {
+        try {
+            val encrypted = encryptor.encrypt(value)
+            dataStore.edit { prefs ->
+                prefs[stringKey(key)] = Base64.encode(encrypted)
+            }
+            logger.log(VaultOperation.PUT, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.PUT, key, false, e.message)
+            throw e
         }
     }
     
-    @OptIn(ExperimentalEncodingApi::class)
-    override suspend fun getBytes(key: String): ByteArray? {
-        val prefs = dataStore.data.first()
-        val encoded = prefs[stringKey(key)] ?: return null
-        return encryptor.decrypt(Base64.decode(encoded))
+    override suspend fun getBytes(key: String): ByteArray? = mutex.withLock {
+        try {
+            val prefs = dataStore.data.first()
+            val encoded = prefs[stringKey(key)] ?: return@withLock null
+            val result = encryptor.decrypt(Base64.decode(encoded))
+            logger.log(VaultOperation.GET, key, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.GET, key, false, e.message)
+            null
+        }
     }
     
     // ==================== Object Operations ====================
@@ -193,29 +228,48 @@ internal class AndroidVault(
     
     // ==================== Utility Operations ====================
     
-    override suspend fun contains(key: String): Boolean {
+    override suspend fun contains(key: String): Boolean = mutex.withLock {
         val prefs = dataStore.data.first()
-        return prefs.contains(stringKey(key))
+        val result = prefs.contains(stringKey(key))
+        logger.log(VaultOperation.CONTAINS, key, true)
+        result
     }
     
-    override suspend fun remove(key: String) {
-        dataStore.edit { prefs ->
-            prefs.remove(stringKey(key))
+    override suspend fun remove(key: String): Unit = mutex.withLock {
+        try {
+            dataStore.edit { prefs ->
+                prefs.remove(stringKey(key))
+            }
+            logger.log(VaultOperation.REMOVE, key, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.REMOVE, key, false, e.message)
         }
     }
     
-    override suspend fun clear() {
-        dataStore.edit { prefs ->
-            prefs.clear()
+    override suspend fun clear(): Unit = mutex.withLock {
+        try {
+            dataStore.edit { prefs ->
+                prefs.clear()
+            }
+            logger.log(VaultOperation.CLEAR, null, true)
+        } catch (e: Exception) {
+            logger.log(VaultOperation.CLEAR, null, false, e.message)
         }
     }
     
-    override suspend fun keys(): Set<String> {
-        val prefs = dataStore.data.first()
-        return prefs.asMap().keys
-            .filterIsInstance<Preferences.Key<String>>()
-            .map { it.name.removePrefix("vault_") }
-            .toSet()
+    override suspend fun keys(): Set<String> = mutex.withLock {
+        try {
+            val prefs = dataStore.data.first()
+            val result = prefs.asMap().keys
+                .filterIsInstance<Preferences.Key<String>>()
+                .map { it.name.removePrefix("vault_") }
+                .toSet()
+            logger.log(VaultOperation.KEYS, null, true)
+            result
+        } catch (e: Exception) {
+            logger.log(VaultOperation.KEYS, null, false, e.message)
+            emptySet()
+        }
     }
     
     // ==================== Type-Safe Entry Accessors ====================
@@ -252,7 +306,11 @@ internal class AndroidVault(
     
     override fun observeString(key: String): Flow<String?> {
         return dataStore.data.map { prefs ->
-            prefs[stringKey(key)]?.let { decodeAndDecrypt(it) }
+            try {
+                prefs[stringKey(key)]?.let { decodeAndDecrypt(it) }
+            } catch (e: Exception) {
+                null
+            }
         }
     }
     
