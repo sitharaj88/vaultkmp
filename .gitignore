@@ -1,0 +1,64 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!gradle/wrapper/gradle-wrapper.properties
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+*.swp
+*.swo
+
+# Kotlin
+*.kotlin_module
+.kotlin/
+
+# Android
+local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+/captures
+.externalNativeBuild/
+.cxx/
+
+# iOS
+*.xcworkspace
+!iosApp/*.xcworkspace
+*.xcuserdata
+*.xcscmblueprint
+Pods/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Logs
+*.log
+
+# Local configuration
+secrets.properties
+keystore.properties
+*.gpg
+secring.gpg
+
+# Generated
+generated/
+
+# Publishing artifacts
+*.asc
+vaultkmp-bundle.zip
